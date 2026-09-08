@@ -1,7 +1,7 @@
 # poezio-plugins
 
 ## Notifications for i3blocks
-Tracks which Profanity conversations have unread messages and shares that state with an i3blocks 
+Tracks which Poezio conversations have unread messages and shares that state with an i3blocks 
 status-bar blocklet, so the bar can show an unread-message icon.
 
 ### Dependencies
