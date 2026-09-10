@@ -1,6 +1,8 @@
+import asyncio
 import atexit
 import os
 import subprocess
+import time
 
 try:
     from poezio.plugin import BasePlugin
@@ -66,6 +68,71 @@ class Plugin(BasePlugin):
             pass
         self._unread.clear()
         self._save_and_signal()
+
+    # async notifications
+    async def _should_notify(self, tab) -> bool:
+        """
+        True if this message should be surfaced to i3blocks: either
+        it's not poezio's currently-selected tab, or it is, but the
+        terminal itself doesn't actually have focus right now (so
+        you're not really looking at it).
+        """
+        if tab != self.api.current_tab():
+            return True
+        focused = await self._terminal_has_focus()
+        # Unknown (no DISPLAY, xdotool missing, ...) -> notify anyway.
+        # Missing a message is worse than one extra blink.
+        return not focused
+
+    async def _terminal_has_focus(self):
+        now = time.monotonic()
+        cached = getattr(self, '_focus_cache', None)
+        if cached is not None and now - cached[0] < 0.5:
+            return cached[1]
+        value = await self._compute_terminal_focus()
+        self._focus_cache = (now, value)
+        return value
+
+    async def _compute_terminal_focus(self):
+        if not os.environ.get('DISPLAY'):
+            return None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                'xdotool', 'getactivewindow', 'getwindowpid',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await proc.communicate()
+        except (FileNotFoundError, OSError):
+            return None
+        try:
+            focused_pid = int(out.strip())
+        except ValueError:
+            return None
+        return focused_pid in self._own_ancestor_pids()
+
+    @staticmethod
+    def _own_ancestor_pids(max_depth=12):
+        pids = set()
+        current = os.getpid()
+        for _ in range(max_depth):
+            if current is None or current <= 1 or current in pids:
+                break
+            pids.add(current)
+            current = Plugin._parent_pid(current)
+        return pids
+
+    @staticmethod
+    def _parent_pid(pid):
+        try:
+            with open(f'/proc/{pid}/stat') as f:
+                data = f.read()
+            # comm (2nd field) is in parens and can itself contain
+            # spaces/parens, so split on the *last* ')'
+            fields = data.rsplit(')', 1)[1].split()
+            return int(fields[1])  # ppid
+        except (OSError, IndexError, ValueError):
+            return None
 
     # ---- State persistence & signaling -----------------------------------
 
@@ -143,7 +210,7 @@ class Plugin(BasePlugin):
 
     # ---- Event Handlers --------------------------------------------------
 
-    def on_conversation_msg(self, message, tab):
+    async def on_conversation_msg(self, message, tab):
         if not message['body']:
             return
         if find_delayed_tag(message)[0]:
@@ -154,23 +221,23 @@ class Plugin(BasePlugin):
         except Exception:
             pass
 
-        if tab != self.api.current_tab():
+        if await self._should_notify(tab):
             ident = self._get_tab_identifier(tab)
             if ident:
                 self._mark_unread(ident)
 
-    def on_private_msg(self, message, tab):
+    async def on_private_msg(self, message, tab):
         if not message['body']:
             return
         if find_delayed_tag(message)[0]:
             return
 
-        if tab != self.api.current_tab():
+        if await self._should_notify(tab):
             ident = self._get_tab_identifier(tab)
             if ident:
                 self._mark_unread(ident)
 
-    def on_muc_msg(self, message, tab):
+    async def on_muc_msg(self, message, tab):
         if not message['body']:
             return
         if find_delayed_tag(message)[0]:
@@ -182,18 +249,18 @@ class Plugin(BasePlugin):
         if hasattr(tab, 'own_nick') and nick == tab.own_nick:
             return
 
-        if tab != self.api.current_tab():
+        if await self._should_notify(tab):
             ident = self._get_tab_identifier(tab)
             if ident:
                 self._mark_unread(ident)
 
-    def on_highlight(self, message, tab):
+    async def on_highlight(self, message, tab):
         if not message['body']:
             return
         if find_delayed_tag(message)[0]:
             return
 
-        if tab != self.api.current_tab():
+        if await self._should_notify(tab):
             ident = self._get_tab_identifier(tab)
             if ident:
                 self._mark_unread(ident)
