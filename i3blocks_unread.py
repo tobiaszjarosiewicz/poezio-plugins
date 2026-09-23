@@ -1,6 +1,7 @@
 import asyncio
 import atexit
 import os
+import shutil
 import subprocess
 import time
 
@@ -26,16 +27,28 @@ except ImportError:
 
 STATE_FILE = os.path.expanduser("~/.cache/i3blocks-poezio-unread")
 SIGNAL = 10  # SIGRTMIN+10 -- must match signal= in i3blocks config
+DEFAULT_SOUND_FILE = '/usr/share/sounds/freedesktop/stereo/message-new-instant.oga'
+SOUND_PLAYER_CANDIDATES = ('paplay', 'pw-play', 'aplay', 'ffplay')
 
 # Set to True to notify on every message in a MUC.
 # Set to False if you only want notifications when mentioned/highlighted.
 NOTIFY_ALL_MUC = True
+
+def _sound_command(player, sound_file):
+    if player == 'aplay':
+        return [player, '-q', sound_file]
+    if player == 'ffplay':
+        return [player, '-nodisp', '-autoexit', '-loglevel', 'quiet', sound_file]
+    return [player, sound_file]  # paplay, pw-play
 
 
 class Plugin(BasePlugin):
     def init(self):
         self._unread = set()
         self._load()
+        self._sound_player_cache = None  # None = not probed yet, '' = none found
+        self._last_sound_time = 0.0
+
 
         # Catch tabs already unread when the plugin is loaded
         if hasattr(self.core, 'tabs'):
@@ -46,6 +59,17 @@ class Plugin(BasePlugin):
                         self._unread.add(ident)
 
         self._save_and_signal()
+
+        self.api.add_command(
+            'sound_test',
+            self.command_sound_test,
+            usage='[delay_seconds]',
+            help=('Diagnose the sound-notification pipeline and try to play '
+                'the configured sound immediately, bypassing all the '
+                'normal gating. Optionally wait N seconds first so you can '
+                'switch to another window before the focus check runs.'),
+            short='Test the notification sound',
+        )
 
         # Message hooks
         self.api.add_event_handler('conversation_msg', self.on_conversation_msg)
@@ -61,6 +85,55 @@ class Plugin(BasePlugin):
 
         atexit.register(self.cleanup)
 
+
+    def _sound_events(self):
+        raw = self.config.get('sound_events',
+                              'conversation_msg,private_msg,highlight')
+        return {e.strip() for e in raw.split(',') if e.strip()}
+
+    def _resolve_sound_player(self):
+        if self._sound_player_cache is not None:
+            return self._sound_player_cache or None
+        forced = self.config.get('sound_player', '').strip()
+        candidates = [forced] if forced else list(SOUND_PLAYER_CANDIDATES)
+        for candidate in candidates:
+            if candidate and shutil.which(candidate):
+                self._sound_player_cache = candidate
+                return candidate
+        self._sound_player_cache = ''
+        return None
+
+    async def _maybe_play_sound(self, event_name):
+        if event_name not in self._sound_events():
+            return
+
+        sound_file = self.config.get('sound_file', DEFAULT_SOUND_FILE)
+        if not sound_file or not os.path.isfile(sound_file):
+            return
+
+        if await self._terminal_has_focus():
+            return  # you're looking at it, no need to ding
+
+        cooldown = self.config.get('sound_cooldown', 3.0)
+        now = time.monotonic()
+        if now - self._last_sound_time < cooldown:
+            return
+
+        player = self._resolve_sound_player()
+        if not player:
+            return
+
+        self._last_sound_time = now
+        try:
+            await asyncio.create_subprocess_exec(
+                *_sound_command(player, sound_file),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except OSError:
+            pass
+
+
     def cleanup(self):
         try:
             atexit.unregister(self.cleanup)
@@ -68,6 +141,98 @@ class Plugin(BasePlugin):
             pass
         self._unread.clear()
         self._save_and_signal()
+
+    async def command_sound_test(self, args: str) -> None:
+        """
+        Diagnose the sound pipeline step by step and actually try to
+        play the sound, bypassing the event filter, the focus check,
+        and the cooldown -- and, unlike normal playback, surfaces
+        whatever the player itself printed on failure instead of
+        swallowing it.
+
+        Usage: /sound_test [delay_seconds]
+
+        Running it with no argument checks focus *right now*, which
+        is trivially always "focused" since you just typed a command
+        into this terminal. Pass a delay (e.g. `/sound_test 5`) to
+        get a few seconds to switch to another window first, so the
+        focus check reflects a genuinely unfocused terminal.
+        """
+        sound_file = self.config.get('sound_file', DEFAULT_SOUND_FILE)
+        self.api.information('sound_file = %s' % sound_file, 'Info')
+        if not sound_file or not os.path.isfile(sound_file):
+            self.api.information(
+                'File not found or unreadable: %r -- fix sound_file in the '
+                'config before going further.' % sound_file, 'Error')
+            return
+        self.api.information('Sound file exists, OK.', 'Info')
+
+        args = args.strip()
+        delay = 0.0
+        if args:
+            try:
+                delay = float(args)
+            except ValueError:
+                self.api.information(
+                    'Usage: /sound_test [delay_seconds] -- %r is not a '
+                    'number' % args, 'Error')
+                return
+
+        if delay > 0:
+            self.api.information(
+                'Waiting %.3gs -- switch to another window now to test the '
+                '"unfocused" path for real.' % delay, 'Info')
+            await asyncio.sleep(delay)
+
+        # Force a fresh read: don't trust the 0.5s cache from before
+        # the wait (or from a previous /sound_test).
+        self._focus_cache = None
+        focused = await self._terminal_has_focus()
+        self.api.information(
+            '_terminal_has_focus() currently reports: %r (True = sound '
+            'would be suppressed right now in normal operation; None = '
+            'undetectable, falls back to "play")' % (focused,), 'Info')
+
+        # Force a fresh probe: don't trust a cached "not found" from
+        # earlier in the session.
+        self._sound_player_cache = None
+        player = self._resolve_sound_player()
+        if not player:
+            forced = self.config.get('sound_player', '').strip()
+            checked = forced or ', '.join(SOUND_PLAYER_CANDIDATES)
+            self.api.information(
+                'No usable sound player found on PATH (checked: %s). '
+                'Install one of these, or set sound_player explicitly.'
+                % checked, 'Error')
+            return
+        self.api.information('Using player: %s' % player, 'Info')
+
+        cmd = _sound_command(player, sound_file)
+        self.api.information('Running: ' + ' '.join(cmd), 'Info')
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await proc.communicate()
+        except OSError as exc:
+            self.api.information('Failed to launch %r: %s' % (player, exc),
+                                 'Error')
+            return
+
+        if proc.returncode == 0:
+            self.api.information(
+                "Player exited successfully. If you didn't hear anything, "
+                'the problem is downstream of poezio: wrong audio '
+                'sink/device, volume/mute, or this process landing in a '
+                "different audio session than your desktop's.", 'Info')
+        else:
+            detail = (err or out or b'').decode(errors='replace').strip()
+            self.api.information(
+                '%s exited with code %s: %s'
+                % (player, proc.returncode, detail or '(no output)'),
+                'Error')
 
     # async notifications
     async def _should_notify(self, tab) -> bool:
@@ -221,6 +386,7 @@ class Plugin(BasePlugin):
         except Exception:
             pass
 
+        await self._maybe_play_sound('conversation_msg')
         if await self._should_notify(tab):
             ident = self._get_tab_identifier(tab)
             if ident:
