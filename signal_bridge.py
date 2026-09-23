@@ -70,35 +70,6 @@ def _poezio_version():
         return "unknown"
 
 
-def backup_image_to_ascii(path):
-    """Pure function: no poezio calls, no state, safe from any thread.
-    Returns None on any failure instead of raising."""
-    if not CHAFA:
-        return None
-    try:
-        command = [
-            CHAFA,
-            "--format=symbols",
-            "--symbols=block+border+space",
-            "--colors=256",
-            "-s", ASCII_SIZE,
-            path,
-        ]
-        result = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            timeout=5,
-        )
-        if result.returncode != 0:
-            return None
-        return result.stdout.strip("\r\n") or None
-    except Exception:
-        return None
-
-
 _ANSI_CSI_RE = re.compile(r'\x1b\[([0-9;]*)m')
 
 # ---------------------------------------------------------------------------
