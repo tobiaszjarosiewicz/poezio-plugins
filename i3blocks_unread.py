@@ -52,6 +52,8 @@ class Plugin(BasePlugin):
         self._load()
         self._sound_player_cache = None  # None = not probed yet, '' = none found
         self._last_sound_time = 0.0
+        self._focus_poll_task = None
+        self._focus_poll_last = None
 
 
         # Catch tabs already unread when the plugin is loaded
@@ -63,6 +65,8 @@ class Plugin(BasePlugin):
                         self._unread.add(ident)
 
         self._save_and_signal()
+        if self._unread:
+            self._start_focus_poll()
 
         self.api.add_command(
             'sound_test',
@@ -95,6 +99,22 @@ class Plugin(BasePlugin):
         raw = self.config.get('sound_events',
                               'conversation_msg,private_msg,highlight')
         return {e.strip() for e in raw.split(',') if e.strip()}
+
+    def _start_focus_poll(self):
+        """Begin watching for the moment the terminal regains X focus,
+        so we can clear the unread flag even when the user never
+        actually changes poezio tabs (they were already on the tab
+        that received the message)."""
+        if self._focus_poll_task is None or self._focus_poll_task.done():
+            # Assume "focused" as the starting point so the first tick
+            # of the loop can't itself look like a false->true transition.
+            self._focus_poll_last = True
+            self._focus_poll_task = asyncio.ensure_future(self._focus_poll_loop())
+
+    def _stop_focus_poll(self):
+        if self._focus_poll_task is not None:
+            self._focus_poll_task.cancel()
+            self._focus_poll_task = None
 
     def _resolve_sound_player(self):
         if self._sound_player_cache is not None:
@@ -144,6 +164,7 @@ class Plugin(BasePlugin):
             atexit.unregister(self.cleanup)
         except Exception:
             pass
+        self._stop_focus_poll()
         self._unread.clear()
         self._save_and_signal()
 
@@ -281,6 +302,33 @@ class Plugin(BasePlugin):
             return None
         return focused_pid in self._own_ancestor_pids()
 
+    async def _focus_poll_loop(self):
+        if not os.environ.get('DISPLAY'):
+            return  # undetectable; fall back to tab-change-only clearing
+
+        interval = self.config.get('focus_poll_interval', 0.4)
+        try:
+            while self._unread:
+                await asyncio.sleep(interval)
+                if not self._unread:
+                    break
+
+                focus = await self._compute_terminal_focus()
+                if focus is None:
+                    continue  # transient xdotool hiccup, retry next tick
+
+                if focus and not self._focus_poll_last:
+                    # false -> true transition: you just looked at the terminal
+                    tab = self.api.current_tab()
+                    if tab:
+                        self._mark_read(tab)
+
+                self._focus_poll_last = focus
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._focus_poll_task = None
+
     @staticmethod
     def _own_ancestor_pids(max_depth=12):
         pids = set()
@@ -354,6 +402,7 @@ class Plugin(BasePlugin):
         if identifier not in self._unread:
             self._unread.add(identifier)
             self._save_and_signal()
+        self._start_focus_poll()
 
     def _mark_read(self, tab):
         self._load()
