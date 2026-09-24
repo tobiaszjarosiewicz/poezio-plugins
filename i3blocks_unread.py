@@ -5,6 +5,8 @@ import shutil
 import subprocess
 import time
 
+import logging
+
 try:
     from poezio.plugin import BasePlugin
 except ImportError:
@@ -29,6 +31,8 @@ STATE_FILE = os.path.expanduser("~/.cache/i3blocks-poezio-unread")
 SIGNAL = 10  # SIGRTMIN+10 -- must match signal= in i3blocks config
 DEFAULT_SOUND_FILE = '/usr/share/sounds/freedesktop/stereo/message-new-instant.oga'
 SOUND_PLAYER_CANDIDATES = ('paplay', 'pw-play', 'aplay', 'ffplay')
+
+log = logging.getLogger(__name__)
 
 # Set to True to notify on every message in a MUC.
 # Set to False if you only want notifications when mentioned/highlighted.
@@ -73,6 +77,7 @@ class Plugin(BasePlugin):
 
         # Message hooks
         self.api.add_event_handler('conversation_msg', self.on_conversation_msg)
+        self.api.add_event_handler('signal_msg', self.on_signal_msg)
         self.api.add_event_handler('private_msg', self.on_private_msg)
 
         if NOTIFY_ALL_MUC:
@@ -376,6 +381,7 @@ class Plugin(BasePlugin):
     # ---- Event Handlers --------------------------------------------------
 
     async def on_conversation_msg(self, message, tab):
+        log.debug("[i3blocks] on_conversation_msg ENTER: body=%r, tab=%r", message['body'] if message else None, tab)
         if not message['body']:
             return
         if find_delayed_tag(message)[0]:
@@ -393,6 +399,7 @@ class Plugin(BasePlugin):
                 self._mark_unread(ident)
 
     async def on_private_msg(self, message, tab):
+        log.debug("[i3blocks] on_private_msg ENTER: body=%r, tab=%r", message['body'] if message else None, tab)
         if not message['body']:
             return
         if find_delayed_tag(message)[0]:
@@ -403,7 +410,23 @@ class Plugin(BasePlugin):
             if ident:
                 self._mark_unread(ident)
 
+    async def on_signal_msg(self, tab, text='', kind='message'):
+        """signal_bridge fires 'signal_msg' whenever it displays an
+        incoming Signal message (kind='message') or a reaction to one of
+        your messages (kind='reaction'). It never fires for messages sent
+        from your own linked devices."""
+        if kind == 'reaction' and not self.config.get('notify_reactions', True):
+            return
+        # Same sound policy as ordinary chat messages, so the existing
+        # sound_events / cooldown / focus configuration applies unchanged.
+        await self._maybe_play_sound('conversation_msg')
+        if await self._should_notify(tab):
+            ident = self._get_tab_identifier(tab)
+            if ident:
+                self._mark_unread(ident)
+
     async def on_muc_msg(self, message, tab):
+        log.debug("[i3blocks] on_muc_msg ENTER: body=%r, tab=%r", message['body'] if message else None, tab)
         if not message['body']:
             return
         if find_delayed_tag(message)[0]:

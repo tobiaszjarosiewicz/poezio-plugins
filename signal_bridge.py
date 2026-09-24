@@ -10,6 +10,7 @@ Installation: copy to ~/.local/share/poezio/plugins/ and run:
     /load signal_bridge
 """
 
+import asyncio
 import json
 import os
 import queue
@@ -21,8 +22,9 @@ import subprocess
 import threading
 import time
 import uuid
+import logging
 
-from slixmpp import JID
+from slixmpp import JID, Message
 
 from poezio import tabs as poezio_tabs
 from poezio import timed_events
@@ -32,6 +34,8 @@ try:
     from poezio.ui.types import InfoMessage  # poezio >= 0.13 message objects
 except Exception:
     InfoMessage = None
+
+log = logging.getLogger(__name__)
 
 DEFAULT_SOCKET_PATH = os.path.expanduser("~/.local/state/signal-cli/socket")
 DEFAULT_ATTACHMENTS_DIR = os.path.expanduser("~/.local/share/signal-cli/attachments")
@@ -809,7 +813,10 @@ class Plugin(BasePlugin):
                         data = json.loads(raw_line)
                     except ValueError:
                         continue
-                    self._handle_notification(data)
+                    try:
+                        self._handle_notification(data)
+                    except Exception:
+                        log.exception("[signal_bridge] Exception in _handle_notification")
 
                 sock.close()
             except OSError as exc:
@@ -871,6 +878,8 @@ class Plugin(BasePlugin):
                     self._display_queue.put(("__ensure__", key))
                     self._display_queue.put((key, message))
                     self._display_queue.put(("__notify__", message))
+                    self._display_queue.put(
+                        ("__incoming__", (key, message, "reaction")))
                     return
 
         # Normal incoming message: text and/or image attachments
@@ -891,7 +900,9 @@ class Plugin(BasePlugin):
                     ("__notify__", "%s: %s" % (label, notify_text)))
                 return
 
-        # Messages sent from another linked Signal device
+        # Messages sent from another linked Signal device: displayed but
+        # deliberately NOT reported as incoming -- they are your own
+        # messages, and the XMPP notifier ignores self-messages too.
         sync_message = envelope.get("syncMessage")
         if sync_message and sync_message.get("sentMessage"):
             sent = sync_message["sentMessage"]
@@ -947,6 +958,7 @@ class Plugin(BasePlugin):
                 % (type(exc).__name__, exc), "Error")
 
     def _poll_queue(self, *_args):
+        #log.debug("[signal_bridge] poll queue is called with: %r", _args)
         if self._stop_event.is_set():
             return
         try:
@@ -958,6 +970,7 @@ class Plugin(BasePlugin):
                 try:
                     self._dispatch(key, message)
                 except Exception as exc:
+                    log.exception("[signal_bridge] CRASH in _dispatch: %s", exc)
                     self.api.information(
                         "signal_bridge: error displaying a message: %s: %s"
                         % (type(exc).__name__, exc), "Error")
@@ -970,21 +983,58 @@ class Plugin(BasePlugin):
             self._ensure_tab(message)
             return
         if key == "__notify__":
-            self.api.information("[Signal] " + message, "Info")
+            log.debug("[signal_bridge] dispatch > notify")
             self._notify(message)
             return
         if key == "__log_info__":
-            self.api.information("signal_bridge: " + message, "Info")
+            log.debug("[signal_bridge] dispatch > log_info")
             return
         if key == "__log_error__":
+            log.debug("[signal_bridge] dispatch > log_error")
             self.api.information("signal_bridge: " + message, "Error")
             return
+        if key == "__incoming__":
+            # Discard any leftover __incoming__ tuples so no tab is created
+            log.debug("[signal_bridge] ignoring legacy __incoming__ queue item")
+            return
+
+        # Regular message delivered to a contact tab
         tab = self._ensure_tab(key)
         if tab is not None:
-            self._write_tab(tab, message)
+            log.debug("[signal_bridge] dispatch > tab not none > message: %r", message)
+
+            # Ensure message is a string before passing to _write_tab
+            if isinstance(message, tuple):
+                # If a tuple ever slips through, extract the text
+                message_text = str(message[1]) if len(message) > 1 else str(message)
+            else:
+                message_text = str(message)
+
+            try:
+                self._write_tab(tab, message_text)
+            except Exception as exc:
+                log.exception("[signal_bridge] Error in _write_tab: %s", exc)
+
+            # Safely check active tab and update unread indicators
+            try:
+                current = self.api.current_tab()
+                if tab != current:
+                    tab.state = 'message'
+                    if hasattr(tab, 'nb_unread'):
+                        tab.nb_unread += 1
+                    if hasattr(self.core, 'doupdate'):
+                        self.core.doupdate()
+            except Exception as exc:
+                log.exception("[signal_bridge] Error updating tab state: %s", exc)
+
+            # Fire conversation_msg for i3blocks_unread
+            log.debug("[signal_bridge] triggering notification for tab %r", tab)
+            self._fire_conversation_msg(tab, message_text)
+
         else:
-            # tab creation failed -- still surface the message
+            log.debug("[signal_bridge] dispatch > tab create failed")
             self.api.information("[Signal/%s] %s" % (key, message), "Info")
+
 
     def _notify(self, message):
         """Desktop notification, best effort (the API has moved around
@@ -1001,6 +1051,68 @@ class Plugin(BasePlugin):
             notify.show_notification(message, 5000)
         except Exception:
             pass
+
+    def _make_signal_message(self, body):
+        """Build a minimal slixmpp Message stanza using Poezio's active client."""
+        try:
+            xmpp = getattr(self.core, "xmpp", None)
+            if xmpp is None or not hasattr(xmpp, "make_message"):
+                log.error("[signal_bridge] xmpp client not ready or missing make_message")
+                return None
+
+            from slixmpp import JID
+
+            # Our own JID is the recipient of incoming Signal messages
+            my_jid = getattr(xmpp, "boundjid", None)
+            if my_jid is None:
+                log.error("[signal_bridge] xmpp boundjid is None")
+                return None
+
+            domain = globals().get("SIGNAL_DOMAIN", "signal.local")
+            sender_jid = JID("signal@" + domain)
+
+            # Pass mto as the first positional or keyword argument
+            msg = xmpp.make_message(
+                mto=my_jid,
+                mfrom=sender_jid,
+                mbody=body,
+                mtype='chat'
+            )
+            return msg
+
+        except Exception as exc:
+            log.exception("[signal_bridge] _make_signal_message failed: %s", exc)
+            self.api.information("DEBUG: _make_signal_message failed: %s" % exc, "Error")
+            return None
+
+    def _fire_conversation_msg(self, tab, body):
+        log.debug("[signal_bridge] fire_conv")
+        """Fire 'conversation_msg' event so i3blocks_unread catches it."""
+        events = getattr(self.core, "events", None)
+        log.debug("[signal_bridge] in fire_conv events obj: %r", events)
+        if events is None:
+            log.debug("[signal_bridge] fire > event none")
+            return
+
+        msg = self._make_signal_message(body)
+        if msg is None:
+            log.debug("[signal_bridge] fire > msg is none")
+            return
+
+        trigger_async = getattr(events, "trigger_async", None)
+        trigger = getattr(events, "trigger", None)
+
+        try:
+            # i3blocks_unread defines 'async def on_conversation_msg', which requires trigger_async
+            log.debug("[signal_bridge] fire > try create task")
+            if trigger_async is not None:
+                asyncio.create_task(trigger_async("conversation_msg", msg, tab))
+            elif trigger is not None:
+                trigger("conversation_msg", msg, tab)
+        except Exception as exc:
+            self.api.information(
+                "signal_bridge: could not fire conversation_msg: %s: %s"
+                % (type(exc).__name__, exc), "Warning")
 
     def _start_receiver(self):
         if self._receiver_thread and self._receiver_thread.is_alive():
