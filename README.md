@@ -24,6 +24,7 @@ window (Signal +1555...), and incoming photos are rendered as chafa-generated AS
 
 * signal-cli (with the device registered as a secondary device in the Signal app)
 * chafa (for the images)
+* i3blocks_unread
 
 ### Installation
 
